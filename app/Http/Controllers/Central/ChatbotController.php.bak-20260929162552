@@ -1,0 +1,967 @@
+<?php
+namespace App\Http\Controllers\Central;
+
+
+use Zxing\QrReader;
+use App\Http\Controllers\Controller;
+use Illuminate\Http\Request;
+use App\Services\OllamaService;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Cache;
+use Carbon\Carbon;
+
+class ChatbotController extends Controller
+{
+    private array $endpoints = [
+        'dev' => [
+            'name'  => 'Dev Store',
+            'url'   => 'https://dev.gangsheet-builders.com/api/chatbot/query',
+            'token' => 'MI_TOKEN_SECRETO_ULTRA_SUPER_SEGURO_123',
+        ],
+        'dtt' => [
+            'name'  => 'DTT Orders',
+            'url'   => 'https://dttorders.gangsheet-builders.com/api/chatbot/query',
+            'token' => 'MI_TOKEN_SECRETO_ULTRA_SUPER_SEGURO_123',
+        ],
+    ];
+
+    /**
+     * Detecta la tienda exacta desde donde se hace la consulta.
+     */
+    private function resolveTargetEndpoint(Request $request): array
+    {
+        $origin = $request->input('origin') 
+               ?? $request->header('Origin') 
+               ?? $request->header('Referer') 
+               ?? '';
+
+        if (str_contains($origin, 'dttorders')) {
+            return ['dtt' => $this->endpoints['dtt']];
+        }
+
+        if (str_contains($origin, 'dev.')) {
+            return ['dev' => $this->endpoints['dev']];
+        }
+
+        return ['dtt' => $this->endpoints['dtt']];
+    }
+
+    /**
+     * Consulta únicamente la tienda activa.
+     */
+    private function queryActiveStore(Request $request, array $payload, int $timeout = 15): array
+    {
+        $target = $this->resolveTargetEndpoint($request);
+        $server = reset($target);
+
+        try {
+            $res = Http::timeout($timeout)
+                ->withToken($server['token'])
+                ->post($server['url'], $payload);
+
+            if ($res->successful()) {
+                return $res->json();
+            }
+            Log::error("API Error [{$server['name']}]: " . $res->body());
+        } catch (\Throwable $e) {
+            Log::error("Connection Error [{$server['name']}]: " . $e->getMessage());
+        }
+
+        return ['status' => 'error', 'message' => 'Unable to connect to the store database.'];
+    }
+
+    public function handlePublicStream(Request $request, OllamaService $ollama)
+{
+    set_time_limit(180);
+
+    $request->validate([
+        'message' => 'nullable|string|max:1000',
+        'image'   => 'nullable|string',
+    ]);
+
+    $userMessage = trim($request->input('message') ?? '');
+    $rawImage    = $request->input('image');
+
+    // 1. Sanitizar Base64
+    $imageBase64 = !empty($rawImage) ? preg_replace('#^data:image/\w+;base64,#i', '', $rawImage) : null;
+
+    if (empty($userMessage) && empty($imageBase64)) {
+        return response()->json(['error' => 'Message or image required'], 422);
+    }
+
+    // 2. LECTURA Y EXTRACCIÓN DEL QR CON PREPROCESAMIENTO
+    $qrDetectedRef = null;
+
+    if (!empty($imageBase64)) {
+        // Llama a la función que añade el margen blanco y amplía la imagen
+        $decodedText = $this->decodeQrCode($imageBase64);
+
+        if (!empty($decodedText)) {
+            Log::info("QR decodificado con éxito: " . $decodedText);
+
+            // Si es una URL (.../verify/DTF-123456?item=1)
+            if (str_contains($decodedText, 'http') || str_contains($decodedText, 'verify')) {
+                $path = parse_url($decodedText, PHP_URL_PATH) ?? $decodedText;
+                $segments = explode('/', trim($path, '/'));
+                $lastSegment = end($segments);
+                if (!empty($lastSegment)) {
+                    $qrDetectedRef = strtoupper(trim($lastSegment));
+                }
+            } else {
+                // Texto plano de la referencia (ej: DTF-123456)
+                $qrDetectedRef = strtoupper(trim($decodedText));
+            }
+        }
+    }
+
+    // Si se subió imagen pero falló el QR y el mensaje era para escanear/consultar
+    if (!empty($imageBase64) && !$qrDetectedRef) {
+        $isScanCommand = empty($userMessage) || preg_match('/(?:consultar|ver|check|qr|orden|order|status|imprim|list[oa]|termin|pickup)/i', $userMessage);
+
+        if ($isScanCommand) {
+            return response()->stream(function () {
+                $msg = "⚠️ No se pudo leer el código QR de la imagen. Asegúrate de enfocar bien la etiqueta con buena iluminación.";
+                echo "data: " . json_encode(['text' => $msg]) . "\n\n";
+                echo "data: [DONE]\n\n";
+                if (ob_get_level() > 0) ob_flush();
+                flush();
+            }, 200, [
+                'Content-Type' => 'text/event-stream',
+                'Cache-Control' => 'no-cache',
+                'Connection' => 'keep-alive',
+            ]);
+        }
+    }
+
+    // 3. VALIDACIÓN ESTRICTA DEL QR EN BASE DE DATOS
+    $qrOrderData = null;
+    if ($qrDetectedRef) {$checkRes = $this->queryActiveStore($request, [
+            'action' => 'search_order',
+            'query'  => $qrDetectedRef
+        ], 10);
+
+        if (isset($checkRes['status']) &&$checkRes['status'] === 'success') {
+            $qrOrderData =$checkRes;
+        } else {
+            // Si el QR no existe en la base de datos, cancela y avisa de inmediato
+            return response()->stream(function () use ($qrDetectedRef) {$msg = "🛑 **QR No Válido**: La orden `{$qrDetectedRef}` extraída del código QR no existe en el sistema. No se realizó ninguna acción.";
+                echo "data: " . json_encode(['text' => $msg]) . "\n\n";
+                echo "data: [DONE]\n\n";
+                if (ob_get_level() > 0) ob_flush();
+                flush();
+            }, 200, [
+                'Content-Type' => 'text/event-stream',
+                'Cache-Control' => 'no-cache',
+                'Connection' => 'keep-alive',
+            ]);
+        }
+    }
+
+    $lowerMsg = strtolower($userMessage);
+
+    // Control estricto de Zona Horaria
+    $tz = config('app.timezone') ?: env('APP_TIMEZONE', 'America/Los_Angeles');
+    $now = Carbon::now($tz);
+    $todayFormatted =$now->format('l, F j, Y');
+    $yesterdayFormatted =$now->copy()->subDay()->format('l, F j, Y');
+
+    $filterToday = str_contains($lowerMsg, 'hoy') || str_contains($lowerMsg, 'today');
+    $filterYesterday = str_contains($lowerMsg, 'ayer') || str_contains($lowerMsg, 'yesterday');
+
+    // 4. ASIGNACIÓN DEL IDENTIFICADOR (Prioriza el QR detectado)
+    $targetQuery =$qrDetectedRef;
+
+    if (!$targetQuery) {
+        if (preg_match('/#([A-Za-z0-9_-]+)/', $userMessage, $hashMatches)) {$targetQuery = trim($hashMatches[1]);         } elseif (preg_match('/\b([A-Za-z]{2,5}-\d+(?:-[A-Za-z0-9]+)?)\b/i',$userMessage, $prefixMatches)) {$targetQuery = strtoupper(trim($prefixMatches[1]));         } elseif (preg_match('/\b([A-Z]{8,10})\b/',$userMessage, $psMatches)) {$reservedWords = ['CONFIRM', 'SHIPPING', 'PRINTING', 'DASHBOARD', 'CANCELLED', 'TODAY', 'YESTERDAY', 'AVERAGE', 'REVENUE', 'EXPENSES', 'DETAILS', 'STATUS', 'METRICS'];
+            if (!in_array($psMatches[1],$reservedWords)) {
+                $targetQuery =$psMatches[1];
+            }
+        } elseif (preg_match('/(?:order|orden)\s*#?\s*(\d+)/i', $userMessage,$orderNumMatch)) {
+            $targetQuery = trim($orderNumMatch[1]);
+        } elseif (preg_match('/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/', $userMessage,$emailMatches)) {
+            $targetQuery =$emailMatches[0];
+        } elseif (preg_match('/(?:customer|client|order of|order for|orden de|cliente)\s+([a-zA-Z0-9\s]{2,30})/i', $userMessage,$nameMatches)) {
+            $cleanName = preg_replace('/\b(hoy|today|ayer|yesterday|now|ahora|recent|reciente)\b/i', '', $nameMatches[1]);
+            $targetQuery = trim($cleanName);
+        }
+    }
+
+    $toolOutput = "";
+    $instructionExtra = "";
+    $isActionCommand = false;
+
+    $sessionKey = 'pending_action_' . ($request->input('session_id') ?? $request->ip());
+
+    // CASO 0: Cancelación Rápida
+    if (preg_match('/^(cancel|abort|stop|nevermind|never mind)[\.!]?$/i', $userMessage) && Cache::has($sessionKey)) {
+        Cache::forget($sessionKey);$isActionCommand = true;
+        $toolOutput = json_encode(['status' => 'cancelled']);$instructionExtra = "State clearly: 'Action cancelled. No changes were made.'";
+    }
+
+    // CASO 0.1: Confirmación de Pickup (Manejo de YES con correo y NO sin correo)
+    elseif (Cache::has($sessionKey) && (Cache::get($sessionKey)['type'] ?? '') === 'pickup_confirm') {
+        $pending = Cache::pull($sessionKey);
+        $isActionCommand = true;
+        $targetRef = $pending['query'];
+        
+        $wantsEmail = (bool) preg_match('/^(yes|si|sí|yep|yeah|sure|confirm|send|con correo|with email)[\.!]?$/i', $userMessage);
+        $noEmail    = (bool) preg_match('/^(no|nop|sin correo|without email)[\.!]?$/i', $userMessage);
+
+        if ($wantsEmail || $noEmail) {
+            $res = $this->queryActiveStore($request, [
+                'action'     => 'update_status',
+                'query'      => $targetRef,
+                'status'     => 'Ready for Pickup',
+                'send_email' => $wantsEmail
+            ], 15);
+
+            $toolOutput = json_encode($res);
+            $emailStatusText = $wantsEmail ? "and the confirmation email was sent to the customer." : "WITHOUT sending notification email.";
+            $instructionExtra = "Confirm clearly that order {$targetRef} has been updated to 'Ready for Pickup' {$emailStatusText}";
+        } else {
+            $instructionExtra = "State: 'Action not understood. Status was not updated. Please request the status change again.'";
+        }
+    }
+
+    // CASO 0.2: Confirmación Estándar para otros estados (CORREGIDO: solo si el tipo es update_status)
+    elseif (Cache::has($sessionKey) && (Cache::get($sessionKey)['type'] ?? '') === 'update_status' && preg_match('/^(ok|okay|confirm|yes|si|yep|sure|proceed|do it)[\.!]?$/i', $userMessage)) {
+        $pending = Cache::pull($sessionKey);
+        $isActionCommand = true;
+        $targetRef = $pending['query'];
+        $targetStatus = $pending['status'];
+
+        $res = $this->queryActiveStore($request, [
+            'action' => 'update_status',
+            'query'  => $targetRef,
+            'status' => $targetStatus
+        ], 15);
+
+        $toolOutput = json_encode($res);
+        $instructionExtra = "Confirm clearly that order {$targetRef} has been updated to '{$targetStatus}'. If blocked by pending payment or not found, explain firmly.";
+    }
+
+    // CASO 0.3: Confirmación de Envío de Correo Personalizado (DIRECT STREAM)
+    elseif (Cache::has($sessionKey) && (Cache::get($sessionKey)['type'] ?? '') === 'send_email_confirm') {
+        $pending = Cache::pull($sessionKey);
+        $isConfirmed = (bool) preg_match('/^(yes|si|sí|yep|sure|confirm|confirmar|enviar|send|proceed|proceder)[\.!]?$/i', $userMessage);
+
+        if ($isConfirmed) {
+            $res = $this->queryActiveStore($request, [
+                'action'  => 'send_custom_email',
+                'query'   => $pending['target_ref'] ?? '',
+                'email'   => $pending['email'],
+                'subject' => $pending['subject'],
+                'body'    => $pending['body']
+            ], 20);
+
+            if (isset($res['status']) && $res['status'] === 'success') {
+                $msg = "✅ **Email Sent Successfully!**\n\nThe message has been delivered to **{$pending['email']}**.";
+            } else {
+                $err = $res['message'] ?? 'Failed to send email.';
+                $msg = "❌ **Error Sending Email**: {$err}";
+            }
+        } else {
+            $msg = "🛑 **Email Cancelled**. No message was sent.";
+        }
+
+        return response()->stream(function () use ($msg) {
+            echo "data: " . json_encode(['text' => $msg]) . "\n\n";
+            echo "data: [DONE]\n\n";
+            if (ob_get_level() > 0) ob_flush();
+            flush();
+        }, 200, [
+            'Content-Type'      => 'text/event-stream',
+            'Cache-Control'     => 'no-cache',
+            'Connection'        => 'keep-alive',
+            'X-Accel-Buffering' => 'no',
+        ]);
+    }
+
+    // CASO 0.4: Resolución de Destinatario cuando hay nombres duplicados (DIRECT STREAM)
+    elseif (Cache::has($sessionKey) && Cache::get($sessionKey)['type'] === 'choose_email_recipient') {$pending = Cache::pull($sessionKey);$candidates = $pending['candidates'] ?? [];$rawBody = $pending['raw_body'] ?? '';$selectedCandidate = null;
+
+        $trimmedMsg = trim($userMessage);
+
+        // Si el usuario eligió un número: 1, 2, 3...
+        if (is_numeric($trimmedMsg) && isset($candidates[(int)$trimmedMsg - 1])) {$selectedCandidate = $candidates[(int)$trimmedMsg - 1];
+        } else {
+            // Si el usuario escribió el correo o parte del nombre
+            foreach ($candidates as$cand) {
+                if (str_contains(strtolower($cand['email']), strtolower($trimmedMsg)) || str_contains(strtolower($cand['name']), strtolower($trimmedMsg))) {
+                    $selectedCandidate =$cand;
+                    break;
+                }
+            }
+        }
+
+        if ($selectedCandidate) {
+            $customerName =$selectedCandidate['name'];
+            $customerEmail =$selectedCandidate['email'];
+            $targetRef =$selectedCandidate['ref'] ?? 'DIRECT';
+
+            $subject = "Important update regarding your DTF order";
+            $formattedBody = "Hello {$customerName},\n\n{$rawBody}\n\nBest regards,\nDTF Transfers Affordable Team";
+
+            // Guardar para confirmación final en el siguiente mensaje
+            Cache::put($sessionKey, [
+                'type'       => 'send_email_confirm',
+                'target_ref' => $targetRef,
+                'email'      => $customerEmail,
+                'subject'    => $subject,
+                'body'       => $formattedBody,
+            ], now()->addMinutes(5));
+
+            $previewMsg = "✉️ **Email Preview**\n\n" .
+                "- **To**: {$customerName} (`{$customerEmail}`)\n" .
+                "- **Subject**: {$subject}\n" .
+                "- **Message Preview**:\n> " . str_replace("\n", "\n> ", $formattedBody) . "\n\n" .
+                "⚠️ **Do you want to send this email?** Reply **CONFIRM** / **YES** to dispatch or **CANCEL**.";
+
+            return response()->stream(function () use ($previewMsg) {
+                echo "data: " . json_encode(['text' => $previewMsg]) . "\n\n";
+                echo "data: [DONE]\n\n";
+                if (ob_get_level() > 0) ob_flush();
+                flush();
+            }, 200, [
+                'Content-Type'      => 'text/event-stream',
+                'Cache-Control'     => 'no-cache',
+                'Connection'        => 'keep-alive',
+                'X-Accel-Buffering' => 'no',
+            ]);
+        } else {
+            $errorMsg = "⚠️ Option not recognized. Email dispatch cancelled. Please start again by saying: *Send email to [name]*";
+            return response()->stream(function () use ($errorMsg) {
+                echo "data: " . json_encode(['text' => $errorMsg]) . "\n\n";
+                echo "data: [DONE]\n\n";
+                if (ob_get_level() > 0) ob_flush();
+                flush();
+            }, 200, [
+                'Content-Type'      => 'text/event-stream',
+                'Cache-Control'     => 'no-cache',
+                'Connection'        => 'keep-alive',
+                'X-Accel-Buffering' => 'no',
+            ]);
+        }
+    }
+
+    // CASO 1: Confirmación de Compra de Etiqueta
+    elseif (preg_match('/(?:confirm(?:ar)?\s*(?:label|etiqueta|ship(?:ping)?))\s*([A-Za-z0-9#-]+)\s*(?:with|con|via)?\s*([a-zA-Z0-9\s_]+)/i', $userMessage, $labelConfirmMatch)) {$isActionCommand = true;
+        $targetRef = ltrim(trim($labelConfirmMatch[1]), '#');
+        $selectedService = trim($labelConfirmMatch[2]);
+
+        $res = $this->queryActiveStore($request, [
+            'action'  => 'buy_shipping_label',
+            'query'   => $targetRef,
+            'service' => $selectedService
+        ], 25);
+
+        $toolOutput = json_encode($res);$data = $res['data'] ?? $res;
+
+        if (!empty($data['label_url'])) {$instructionExtra = "Confirm that the shipping label was purchased successfully. Display:\n- **Reference**: {$data['reference']}\n- **Carrier**: {$data['carrier']}\n- Direct button: [Download Shipping Label Here]({$data['label_url']})\nDo NOT display tracking numbers. NEVER modify URLs.";
+        } else {
+            $instructionExtra = "Explain the error returned clearly: " . ($data['message'] ?? 'Unknown error');
+        }
+    }
+
+    // CASO 2: Confirmación de Cambio de Estado
+    elseif (preg_match('/(?:confirm(?:ar)?\s*(?:status|estado))\s*([A-Za-z0-9#-]+)\s*(?:to|a)\s*([a-zA-Z\s]+)/i', $userMessage, $statusConfirmMatch)) {$isActionCommand = true;
+        $targetRef = ltrim(trim($statusConfirmMatch[1]), '#');
+        $targetStatus = trim($statusConfirmMatch[2]);
+
+        $res = $this->queryActiveStore($request, [
+            'action' => 'update_status',
+            'query'  => $targetRef,
+            'status' => $targetStatus
+        ], 15);
+
+        $toolOutput = json_encode($res);$instructionExtra = "Confirm clearly that order {$targetRef} has been updated to '{$targetStatus}'. If blocked by pending payment or not found, explain firmly.";
+    }
+
+    // DETECCIÓN: Enviar correo personalizado al cliente
+    elseif (preg_match('/(?:send|enviar|mandar|notificar|escribir)\s+(?:an?\s+|un\s+|the\s+|el\s+)?(?:email|correo|mail|message|mensaje)\s+(?:to|a|al cliente)\s*(.*)/i', $userMessage,$emailIntentMatch)) {
+        $content = trim($emailIntentMatch[1] ?? '');
+
+        $splitParts = preg_split('/\s+(?:saying\s+that|saying|diciendo\s+que|diciendo|with\s+message:|con\s+el\s+mensaje:|message:|mensaje:|that|que)\s+/i', $content, 2);$lookupQuery = trim($splitParts[0] ?? '');$rawBody = isset($splitParts[1]) && !empty(trim($splitParts[1]))
+            ? trim($splitParts[1])
+            : "Please contact us regarding an update on your order.";
+
+        if (empty($lookupQuery)) {$msg = "⚠️ Please specify a customer name, email, or order reference (e.g., *Send email to John Doe saying...*).";
+            return response()->stream(function () use ($msg) {
+                echo "data: " . json_encode(['text' => $msg]) . "\n\n";
+                echo "data: [DONE]\n\n";
+                if (ob_get_level() > 0) ob_flush();
+                flush();
+            }, 200, [
+                'Content-Type' => 'text/event-stream',
+                'Cache-Control' => 'no-cache',
+                'Connection' => 'keep-alive',
+                'X-Accel-Buffering' => 'no',
+            ]);
+        }
+
+        $searchRes = $this->queryActiveStore($request, [
+            'action' => 'find_recipients',
+            'query'  => $lookupQuery
+        ], 10);
+
+        // 1. No existe
+        if (!isset($searchRes['status']) || $searchRes['status'] === 'not_found') {$msg = "❌ No customer or order found matching **{$lookupQuery}**. Please verify the spelling or provide an exact email.";
+            return response()->stream(function () use ($msg) {
+                echo "data: " . json_encode(['text' => $msg]) . "\n\n";
+                echo "data: [DONE]\n\n";
+                if (ob_get_level() > 0) ob_flush();
+                flush();
+            }, 200, [
+                'Content-Type' => 'text/event-stream',
+                'Cache-Control' => 'no-cache',
+                'Connection' => 'keep-alive',
+                'X-Accel-Buffering' => 'no',
+            ]);
+        }
+
+        // 2. Múltiples clientes encontrados
+        if (isset($searchRes['type']) &&$searchRes['type'] === 'multiple') {
+            Cache::put($sessionKey, [
+                'type'       => 'choose_email_recipient',
+                'candidates' => $searchRes['data'],
+                'raw_body'   => $rawBody,
+            ], now()->addMinutes(5));
+
+            $listText = "Here is the list of customers matching the name **\"{$lookupQuery}\"**:\n\n";
+            foreach ($searchRes['data'] as $idx =>$cand) {
+                $num =$idx + 1;
+                $listText .= "{$num}. **{$cand['name']}** — `{$cand['email']}`\n";
+            }
+            $listText .= "\nWhich email address would you like to send this message to? Please reply with the option number (e.g. **1** or **2**) or the email.";
+
+            return response()->stream(function () use ($listText) {
+                echo "data: " . json_encode(['text' => $listText]) . "\n\n";
+                echo "data: [DONE]\n\n";
+                if (ob_get_level() > 0) ob_flush();
+                flush();
+            }, 200, [
+                'Content-Type' => 'text/event-stream',
+                'Cache-Control' => 'no-cache',
+                'Connection' => 'keep-alive',
+                'X-Accel-Buffering' => 'no',
+            ]);
+        }
+
+        // 3. Cliente único
+        $recipientData = $searchRes['data'] ?? [];$customerName  = $recipientData['name'] ?? $lookupQuery;
+        $customerEmail =$recipientData['email'] ?? null;
+        $targetRef     =$recipientData['ref'] ?? 'DIRECT';
+
+        if (empty($customerEmail)) {$msg = "⚠️ Customer **{$customerName}** does not have an email address on file.";
+            return response()->stream(function () use ($msg) {
+                echo "data: " . json_encode(['text' => $msg]) . "\n\n";
+                echo "data: [DONE]\n\n";
+                if (ob_get_level() > 0) ob_flush();
+                flush();
+            }, 200, [
+                'Content-Type' => 'text/event-stream',
+                'Cache-Control' => 'no-cache',
+                'Connection' => 'keep-alive',
+                'X-Accel-Buffering' => 'no',
+            ]);
+        }
+
+        $subject = "Important update regarding your DTF order";
+        $formattedBody = "Hello {$customerName},\n\n{$rawBody}\n\nBest regards,\nDTF Transfers Affordable Team";
+
+        Cache::put($sessionKey, [
+            'type'       => 'send_email_confirm',
+            'target_ref' => $targetRef,
+            'email'      => $customerEmail,
+            'subject'    => $subject,
+            'body'       => $formattedBody,
+        ], now()->addMinutes(5));
+
+        $previewMsg = "✉️ **Email Preview**\n\n" .
+            "- **To**: {$customerName} (`{$customerEmail}`)\n" .
+            "- **Subject**: {$subject}\n" .
+            "- **Message Preview**:\n> " . str_replace("\n", "\n> ", $formattedBody) . "\n\n" .
+            "⚠️ **Do you want to send this email?** Reply **CONFIRM** / **YES** to dispatch or **CANCEL**.";
+
+        return response()->stream(function () use ($previewMsg) {
+            echo "data: " . json_encode(['text' => $previewMsg]) . "\n\n";
+            echo "data: [DONE]\n\n";
+            if (ob_get_level() > 0) ob_flush();
+            flush();
+        }, 200, [
+            'Content-Type' => 'text/event-stream',
+            'Cache-Control' => 'no-cache',
+            'Connection' => 'keep-alive',
+            'X-Accel-Buffering' => 'no',
+        ]);
+    }
+
+    // CASO 3: Cotizar Tarifas de Envío
+    elseif (str_contains($lowerMsg, 'label') || str_contains($lowerMsg, 'etiqueta') || str_contains($lowerMsg, 'shippo') || (str_contains($lowerMsg, 'ship') && $targetQuery)) {
+        $isActionCommand = true;
+        $resData = $this->queryActiveStore($request, [
+            'action' => 'get_shipping_rates',
+            'query'  => $targetQuery ?? $userMessage
+        ], 20);
+
+        $toolOutput = json_encode($resData);
+
+        $existingNote = "";
+        if (!empty($resData['already_shipped']) && !empty($resData['existing_label_url'])) {$existingNote = "Note: This order was already shipped. Download current label: [Download Shipping Label Here]({$resData['existing_label_url']}).\n\n";
+        }
+
+        $instructionExtra = "{$existingNote}Present available shipping rates in a clean Markdown table (Carrier | Service | Price | Est. Delivery).\nInstruct: 'Reply: **CONFIRM LABEL {$targetQuery} WITH [Carrier Service]**'.";
+    }
+    // CASO DIRECTO: Pickup en 1 solo clic (con o sin correo)
+    elseif ($targetQuery && 
+        (str_contains($lowerMsg, 'pickup') || str_contains($lowerMsg, 'recog') || str_contains($lowerMsg, 'termin') || str_contains($lowerMsg, 'list')) && 
+        (str_contains($lowerMsg, 'con correo') || str_contains($lowerMsg, 'with email') || str_contains($lowerMsg, 'sin correo') || str_contains($lowerMsg, 'without email'))
+    ) {
+        $isActionCommand = true;
+        $wantsEmail = str_contains($lowerMsg, 'con correo') || str_contains($lowerMsg, 'with email');
+
+        $res = $this->queryActiveStore($request, [
+            'action'     => 'update_status',
+            'query'      => $targetQuery,
+            'status'     => 'Ready for Pickup',
+            'send_email' => $wantsEmail
+        ], 15);
+
+        $toolOutput = json_encode($res);
+        $emailStatusText = $wantsEmail ? "and the confirmation email was sent to the customer." : "WITHOUT sending notification email.";
+        $instructionExtra = "Confirm clearly that order {$targetQuery} has been updated to 'Ready for Pickup' {$emailStatusText}";
+    }
+
+    // CASO 4: Cambio de Estado o Comandos Directos (Ej: "terminó de imprimir")
+    elseif ($targetQuery && (
+        preg_match('/(?:move|change|set|pass|put|mark|print|pickup|hold|cancel|pasal[oa]|mover|cambiar|imprimir)/i', $lowerMsg) ||
+        preg_match('/(?:termin[oó]|list[oa]|ready|finish|finished|ya est[aá]|complet[aoó])/i', $lowerMsg)
+    )) {
+        $isActionCommand = true;
+
+        $isFinishedPrinting = preg_match('/(?:termin[oó]|list[oa]|ready|finish|ya est[aá]|complet)/i', $lowerMsg);
+
+        if ($isFinishedPrinting) {$targetStatus = 'Ready for Pickup';
+        } elseif (str_contains($lowerMsg, 'print') || str_contains($lowerMsg, 'imprim')) {$targetStatus = 'Printing';
+        } elseif (str_contains($lowerMsg, 'pickup') || str_contains($lowerMsg, 'recog')) {$targetStatus = 'Ready for Pickup';
+        } elseif (str_contains($lowerMsg, 'hold') || str_contains($lowerMsg, 'reten')) {$targetStatus = 'Hold';
+        } elseif (str_contains($lowerMsg, 'cancel')) {$targetStatus = 'Cancelled';
+        } elseif (str_contains($lowerMsg, 'ship') || str_contains($lowerMsg, 'envi')) {$targetStatus = 'Shipping';
+        } else {
+            $targetStatus = 'Dashboard';
+        }
+
+        $sessionKey = 'pending_action_' . ($request->input('session_id') ?? $request->ip());
+
+        if ($targetStatus === 'Ready for Pickup') {
+            Cache::put($sessionKey, [
+                'type'   => 'pickup_confirm',
+                'query'  => $targetQuery,
+                'status' => 'Ready for Pickup'
+            ], now()->addMinutes(5));
+
+            $instructionExtra = "The user indicated that order **{$targetQuery}** is finished printing and should move to **Ready for Pickup**.\n" .
+                "State: 'Order **{$targetQuery}** will be updated to **Ready for Pickup**. Do you want to send the notification email to the customer? Reply **YES** (send email) or **NO** (without email).'";
+        } else {
+            Cache::put($sessionKey, [
+                'type'   => 'update_status',
+                'query'  => $targetQuery,
+                'status' => $targetStatus
+            ], now()->addMinutes(5));
+
+            $instructionExtra = "The user wants to change order **{$targetQuery}** to '{$targetStatus}'. Ask for confirmation: '⚠️ Are you sure you want to change order **{$targetQuery}** to **{$targetStatus}**? Reply **OK** or **CONFIRM** to proceed.'";
+        }
+
+        $toolOutput = json_encode($qrOrderData ?? $this->queryActiveStore($request, ['action' => 'search_order', 'query' =>$targetQuery]));
+    }
+
+    // CASO 4.1: Escaneo Pasivo de QR (Solo imagen enviada, o diciendo "ver"/"consultar")
+    elseif ($qrDetectedRef && (empty($userMessage) || preg_match('/^(ver|check|info|status|order|consultar|detalles)?$/i', $userMessage))) {
+        $isActionCommand = true;
+        $toolOutput = json_encode($qrOrderData);$instructionExtra = "Order identified via QR Code.\n" .
+            "1. Present order details in a clean 2-column Markdown Table (| Order Field | Details |) showing: Reference, Customer, Status, Payment Status, Total Paid, Inches, and Carrier.\n" .
+            "2. Suggest next actions: 'You can say: *This order finished printing*, *Move to Hold*, or *Get shipping label*.'";
+    }
+
+    // CASO 5: Cola de Impresión
+    elseif (
+        str_contains($lowerMsg, 'printing') || 
+        str_contains($lowerMsg, 'print queue') || 
+        str_contains($lowerMsg, 'imprimiendo') || 
+        (str_contains($lowerMsg, 'queue') && !str_contains($lowerMsg, 'confirm'))
+    ) {
+        $isActionCommand = true;
+        $res = $this->queryActiveStore($request, [
+            'action' => 'orders_by_status',
+            'status' => 'Printing'
+        ]);
+
+        $rawOrders = $res['data'] ?? [];$flatOrders = [];
+
+        if (is_array($rawOrders)) {
+            foreach ($rawOrders as$o) {
+                if (isset($o['reference'])) {$flatOrders[] = [
+                        'ref'      => $o['reference'],
+                        'customer' => $o['customer'] ?? 'Unknown',
+                        'printer'  => $o['printer'] ?? 'Unassigned'
+                    ];
+                }
+            }
+        }
+
+        $toolOutput = json_encode([
+            'total_orders' => count($flatOrders),
+            'orders'       => $flatOrders
+        ]);
+
+        if (empty($flatOrders)) {$instructionExtra = "State clearly: 'There are currently no orders in the printing queue.' Do NOT print bullet points or sample data.";
+        } else {
+            $instructionExtra = "Present the active printing queue in a concise list in English.\n" .
+                "- State directly: 'Currently, there are **" . count($flatOrders) . "** orders in the printing queue:'\n" .
+                "- List every order strictly as: • **[ref]** — [customer] ([printer])\n" .
+                "- Do NOT add dates, payment status, inches, or store names.";
+        }
+    }
+    // DETECCIÓN: Reporte de Gastos / Desglose por Categoría
+    elseif (preg_match('/(?:expense|gasto|spending|cost|egreso)/i', $lowerMsg) && !str_contains($lowerMsg, 'profit')) {
+        $isActionCommand = true;
+        $isLastMonth = str_contains($lowerMsg, 'last month') || str_contains($lowerMsg, 'mes pasado');
+        
+        $res = $this->queryActiveStore($request, [
+            'action' => 'expense_breakdown',
+            'date'   => $isLastMonth ? 'last_month' : 'this_month'
+        ]);
+        
+        $toolOutput = json_encode($res['data'] ?? $res);
+        $instructionExtra = "Present the Expense Breakdown report in English:\n" .
+            "1. Display the Period and Total Expenses prominently.\n" .
+            "2. Render a 3-column Markdown Table (| Category | Total Spent | Records |).\n" .
+            "3. Highlight the highest cost category in a brief follow-up sentence.";
+    }
+
+    // DETECCIÓN: Reporte Completo de Ganancias / Profit Report
+    elseif (preg_match('/(?:profit|ganancia|net|margen|balance general|financial report|rendimiento)/i', $lowerMsg)) {
+        $isActionCommand = true;
+        $isLastMonth = str_contains($lowerMsg, 'last month') || str_contains($lowerMsg, 'mes pasado');
+
+        $res = $this->queryActiveStore($request, [
+            'action' => 'profit_report',
+            'date'   => $isLastMonth ? 'last_month' : 'this_month'
+        ]);
+
+        $toolOutput = json_encode($res['data'] ?? $res);
+        $instructionExtra = "Present an Executive Profit & Performance Report strictly from [DATABASE RECORD] in English:\n" .
+            "1. Render a clean 2-column Markdown Table (| Financial Indicator | Amount |) showing: Revenue, Total Inches, Operating Expenses, Net Profit, and Profit Margin %.\n" .
+            "2. Provide an analytical sentence evaluating business health for the period.";
+    }
+
+    // CASO 6: Métricas Financieras Generales
+    elseif (
+        !$filterYesterday &&
+        !$filterToday &&
+        (
+            str_contains($lowerMsg, 'average') || 
+            str_contains($lowerMsg, 'promedio') || 
+            str_contains($lowerMsg, 'goal') || 
+            str_contains($lowerMsg, 'meta') || 
+            str_contains($lowerMsg, 'profit') || 
+            str_contains($lowerMsg, 'financial') || 
+            str_contains($lowerMsg, 'balance general') || 
+            str_contains($lowerMsg, 'weekly') || 
+            str_contains($lowerMsg, 'monthly')
+        )
+    ) {
+        $isActionCommand = true;
+        $res =$this->queryActiveStore($request, ['action' => 'financial_metrics']);$toolOutput = json_encode($res['data'] ?? $res);
+
+        $instructionExtra = "Present an authoritative financial summary in English strictly using values from [DATABASE RECORD]:\n" .
+            "1. Render a clean 2-column Markdown Table (| Metric | Value |) containing: Revenue Today, Revenue Yesterday, Revenue This Week, Daily Average This Week, Weekly Goal ($1,425), Weekly Progress %, Month Revenue, Month Expenses, and Estimated Net Profit.\n" .
+            "2. Conclude with 2 concise bullet points evaluating progress against the $285/day goal.";
+    }
+
+    // CASO 7: Deudas / Pendientes de Cobro
+    // CASO 7: Deudas / Pendientes de Cobro
+    elseif (str_contains($lowerMsg, 'unpaid') || str_contains($lowerMsg, 'debt') || str_contains($lowerMsg, 'deuda') || str_contains($lowerMsg, 'pending payment') || str_contains($lowerMsg, 'por cobrar') || str_contains($lowerMsg, 'balance')) {
+        $isActionCommand = true;
+        $res = $this->queryActiveStore($request, ['action' => 'unpaid_stats']);
+        $toolOutput = json_encode($res['data'] ?? $res);$instructionExtra = "Present the unpaid orders summary directly from [DATABASE RECORD]: Total Unpaid Orders, Total Outstanding Balance, and debtor list in a Markdown table. Do NOT fabricate debtors.";
+    }
+
+    // CASO 8: Métricas Diarias (HOY o AYER)
+    elseif (!$targetQuery && (
+        $filterYesterday || $filterToday ||
+        str_contains($lowerMsg, 'inches') || 
+        str_contains($lowerMsg, 'pulgadas') || 
+        str_contains($lowerMsg, 'metrics') || 
+        str_contains($lowerMsg, 'ventas') || 
+        str_contains($lowerMsg, 'ganancia') || 
+        str_contains($lowerMsg, 'revenue') || 
+        str_contains($lowerMsg, 'sales') || 
+        str_contains($lowerMsg, 'earnings')
+    )) {
+        $isActionCommand = true;
+        $targetDate =$filterYesterday ? 'yesterday' : 'today';
+        $dateLabel =$filterYesterday ? "Yesterday ({$yesterdayFormatted})" : "Today ({$todayFormatted})";
+
+        $res = $this->queryActiveStore($request, [
+            'action' => 'daily_stats',
+            'date'   => $targetDate
+        ]);
+
+        if (isset($res['status']) &&$res['status'] === 'error' && str_contains($res['message'] ?? '', 'Invalid action')) {$res = $this->queryActiveStore($request, [
+                'action' => 'today_stats',
+                'date'   => $targetDate
+            ]);
+        }
+
+        $toolOutput = json_encode($res['data'] ?? $res);$instructionExtra = "Present the sales and production summary for {$dateLabel} strictly from [DATABASE RECORD]:\n" .
+            "- State the requested period and exact Date: {$dateLabel}\n" .
+            "- Total Orders Completed/Active\n" .
+            "- Total Revenue Collected\n" .
+            "- Total Inches Printed\n" .
+            "- Pending Orders (Count & Balance)\n" .
+            "Answer directly about {$dateLabel}. State the exact figures provided. Do NOT invent, assume, or pull historical data from 2023.";
+    }
+
+    // CASO 9: Órdenes Recientes
+    elseif (!$targetQuery && (str_contains($lowerMsg, 'recent') || str_contains($lowerMsg, 'latest') || str_contains($lowerMsg, 'ultimas') || str_contains($lowerMsg, 'last orders'))) {
+        $isActionCommand = true;
+        $res = $this->queryActiveStore($request, ['action' => 'recent_orders']);
+        $toolOutput = json_encode($res['data'] ?? $res);$instructionExtra = "Format each order as an individual card separated by (---). Do NOT include tracking numbers. DO NOT use tables.";
+    }
+
+    // CASO 10: Búsqueda Normal por Identificador Escrito
+    elseif ($targetQuery) {$isActionCommand = true;
+        $dateScope = $filterToday ? 'today' : ($filterYesterday ? 'yesterday' : null);
+
+        $res = $this->queryActiveStore($request, [
+            'action' => 'search_order',
+            'query'  => $targetQuery,
+            'date'   => $dateScope
+        ], 12);
+
+        $toolOutput = json_encode($res);$instructionExtra = "If single order: format strictly as a clean 2-column Markdown Table (| Order Field | Details |).\n" .
+            "CRITICAL: Do NOT include Tracking Number, Tracking URL, or Carrier Tracking fields in the table.\n" .
+            "If multiple orders: format each as a card separated by (---).";
+    }
+
+        // Construcción del System Prompt
+        $systemPrompt = "You are Charlie AI, an expert technical advisor and order management assistant. Speak strictly in English.\n";
+        $systemPrompt .= "TEMPORAL AWARENESS CONTEXT:\n";
+        $systemPrompt .= "- Reference Timezone: {$tz}\n";
+        $systemPrompt .= "- Today's Current Date: {$todayFormatted}\n";
+        $systemPrompt .= "- Yesterday's Date: {$yesterdayFormatted}\n";
+        $systemPrompt .= "Core Directives:\n";
+        $systemPrompt .= "- Be direct, technical, and concise. State facts immediately.\n";
+        $systemPrompt .= "- TEMPORAL REASONING: Always anchor your answers to {$todayFormatted}. 'Today' means {$todayFormatted}. 'Yesterday' means {$yesterdayFormatted}. NEVER default to 2023 or any past training cutoff date.\n";
+        
+        // --- NUEVAS REGLAS DE CONCISIÓN ---
+        $systemPrompt .= "- DEFINITIONS & CONCEPTUAL QUESTIONS: When asked 'what is X', definitions, or general questions, answer directly in MAXIMUM 2 to 3 concise sentences (under 60 words). NEVER use bullet points, headers, process steps, or component lists unless the user explicitly commands: 'explain step by step', 'list all', or 'give a complete guide'.\n";
+        $systemPrompt .= "- RAG CONTEXT DISCIPLINE: Use [KNOWLEDGE CONTEXT] only to answer the exact question. NEVER copy or dump full document sections, steps, or bullet lists into the chat.\n";
+        // -----------------------------------
+
+        $systemPrompt .= "- RESPONSE LENGTH: Keep simple questions concise, but provide complete step-by-step answers when the task requires calculations, reasoning, troubleshooting, certification, or detailed explanation. Do not stop before completing the requested answer.\n";
+        $systemPrompt .= "- DETAILED ONLY FOR DATABASE TASKS: For order searches, print queues, or financial metrics, use full Markdown tables or lists as explicitly instructed in TASK.\n";
+        if ($isActionCommand) {
+            $systemPrompt .= "- STRICT DATABASE ACCURACY: For database tasks, NEVER hallucinate, guess, or invent numbers, revenue, order totals, or references. Only output values explicitly provided in [DATABASE RECORD]. If a field is 0 or missing, state 0 or None.\n";
+            $systemPrompt .= "- EVIDENCE DISCIPLINE: NEVER infer payment status, shipment status, completion, authorization, customer intent, or any other operational fact from a different field or status. Order status does NOT prove payment status. If the requested fact is not explicitly present in [DATABASE RECORD], say it cannot be confirmed from the available record.\n";
+        } else {
+            $systemPrompt .= "- STRICT ACCURACY: Do not hallucinate or invent facts. For general reasoning, science, mathematics, troubleshooting, or certification questions, use the user's stated premises, applicable knowledge, and provided knowledge context.\n";
+        }
+        $systemPrompt .= "- NO TRACKING INFORMATION: NEVER show tracking numbers or shipping carrier tracking links in order details unless specifically requested in the TASK.\n";
+        $systemPrompt .= "- ALWAYS separate sections, tables, and bullet points with double newlines.\n";
+        $systemPrompt .= "- NEVER mention store names or multi-branch architectures. Address queries as a unified system.\n";
+
+        // 2. RAG Context (solo busca si el usuario escribió un texto)
+        if (!$isActionCommand) {
+            $behaviorRules = $ollama->getGlobalBehaviorRules();
+            if (!empty($behaviorRules)) {
+                $systemPrompt .= "\n[BUSINESS RULES]\n" . trim($behaviorRules) . "\n";
+            }
+
+            if (!empty($userMessage)) {
+                $docContext = $ollama->searchRelevantChunks($userMessage, 2);
+                if (!empty($docContext)) {
+                    $systemPrompt .= "\n[KNOWLEDGE CONTEXT]\n" . trim($docContext) . "\n";
+                }
+            }
+        }
+
+        if (!empty($toolOutput)) {
+            $systemPrompt .= "\n[DATABASE RECORD]\n" . trim($toolOutput) . "\n";
+            $systemPrompt .= "TASK: {$instructionExtra}\n";
+        }
+
+        // Estructura del mensaje de usuario
+        // Si el QR ya fue procesado por PHP, no enviamos la imagen binaria a Ollama ni usamos moondream
+        $shouldSendImageToOllama = (!empty($imageBase64) && empty($qrDetectedRef));
+
+        // Estructura del mensaje de usuario
+        $userMsgPayload = [
+            'role'    => 'user',
+            'content' => $userMessage ?: ($qrDetectedRef ? "Show order details for {$qrDetectedRef}" : 'Analyze this image and describe what you see.'),
+        ];
+
+        if ($shouldSendImageToOllama) {
+            $userMsgPayload['images'] = [$imageBase64];
+        }
+
+        $messages = [
+            ['role' => 'system', 'content' => $systemPrompt],
+            $userMsgPayload,
+        ];
+
+        // 3. Selección del modelo: solo moondream si es una foto normal sin QR
+        $selectedModel = $shouldSendImageToOllama 
+            ? config('services.ollama.vision_model', 'moondream') 
+            : null;
+
+        // Detectar si el usuario pidió explícitamente una explicación larga o paso a paso
+        $wantsDeepExplanation = (bool) preg_match(
+            '/(?:step by step|paso a paso|how to|guide|guia|list|explain in detail|manual|troubleshoot|calculate|instrucciones)/i', 
+            $lowerMsg
+        );
+
+        // Control dinámico de tokens para acelerar la CPU
+        if ($isActionCommand) {
+            $maxTokens = 700; // Reportes, tablas de pedidos y métricas de base de datos
+        } elseif (!empty($imageBase64)) {
+            $maxTokens = 200; // Descripción breve de imágenes
+        } elseif ($wantsDeepExplanation) {
+            $maxTokens = 500; // Explicaciones técnicas o tutoriales explícitamente solicitados
+        } else {
+            $maxTokens = 120; // Preguntas rápidas ("what is uv dtf", definiciones, saludos) ~60 palabras
+        }
+
+        return response()->stream(function () use ($ollama, $messages, $maxTokens, $selectedModel) {
+            try {
+                $ollama->chatStream($messages, function ($chunk) {
+                    $json = json_decode(trim($chunk), true);
+                    
+                    // 4. Captura de errores de Ollama
+                    if (isset($json['error'])) {
+                        Log::error('Ollama Error Response: ' . $json['error']);
+                        echo "data: " . json_encode(['text' => "⚠️ Ollama Error: " . $json['error']]) . "\n\n";
+                        if (ob_get_level() > 0) ob_flush();
+                        flush();
+                        return;
+                    }
+
+                    if (isset($json['message']['content'])) {
+                        echo "data: " . json_encode(['text' => $json['message']['content']]) . "\n\n";
+                        if (ob_get_level() > 0) ob_flush();
+                        flush();
+                    }
+                }, [
+                    'num_predict' => $maxTokens
+                ], $selectedModel);
+            } catch (\Throwable $e) {
+                Log::error('Chatbot Stream Exception: ' . $e->getMessage());
+                echo "data: " . json_encode(['text' => "⚠️ Error processing request."]) . "\n\n";
+                if (ob_get_level() > 0) ob_flush();
+                flush();
+            }
+
+            echo "data: [DONE]\n\n";
+            if (ob_get_level() > 0) ob_flush();
+            flush();
+        }, 200, [
+            'Content-Type' => 'text/event-stream',
+            'Cache-Control' => 'no-cache',
+            'Connection' => 'keep-alive',
+            'X-Accel-Buffering' => 'no',
+        ]);
+    }
+
+    public function generateVoice(Request $request)
+    {
+        $request->validate(['text' => 'required|string']);
+        $text = trim($request->input('text'));
+
+        try {
+            $response = Http::timeout(10)
+                ->withBody($text, 'text/plain')
+                ->post('http://127.0.0.1:5050/');
+
+            if ($response->successful()) {
+                return response($response->body(), 200, [
+                    'Content-Type' => 'audio/wav',
+                    'Cache-Control' => 'no-cache',
+                ]);
+            }
+        } catch (\Throwable $e) {
+            Log::error('Piper TTS Error: ' . $e->getMessage());
+        }
+
+        return response()->json(['error' => 'TTS generation failed'], 500);
+    }
+    /**
+     * Decodifica un código QR desde Base64 asegurando el margen blanco obligatorio (Quiet Zone).
+     */
+    private function decodeQrCode(string $imageBase64): ?string
+    {
+        $imageBinary = base64_decode($imageBase64);
+        if (!$imageBinary) {
+            return null;
+        }
+
+        // Intento 1: Lectura directa
+        try {
+            $qrcode = new QrReader($imageBinary, QrReader::SOURCE_TYPE_BLOB);
+            $text = trim($qrcode->text() ?: '');
+            if (!empty($text)) {
+                return $text;
+            }
+        } catch (\Throwable $e) {}
+
+        // Intento 2: Inyectar Quiet Zone (margen blanco de 60px) con GD para que ZXing lo detecte
+        try {
+            $src = @imagecreatefromstring($imageBinary);
+            if ($src) {
+                $w = imagesx($src);
+                $h = imagesy($src);
+
+                $pad = 60;
+                $padded = imagecreatetruecolor($w + ($pad * 2), $h + ($pad * 2));
+                $white = imagecolorallocate($padded, 255, 255, 255);
+                imagefilledrectangle($padded, 0, 0, $w + ($pad * 2), $h + ($pad * 2), $white);
+                imagecopy($padded, $src, $pad, $pad, 0, 0, $w, $h);
+
+                $qrcodePadded = new QrReader($padded, QrReader::SOURCE_TYPE_RESOURCE);
+                $textPadded = trim($qrcodePadded->text() ?: '');
+                imagedestroy($padded);
+
+                if (!empty($textPadded)) {
+                    imagedestroy($src);
+                    return $textPadded;
+                }
+
+                // Intento 3: Escalar 2x si la resolución es menor a 600px
+                if ($w < 600) {
+                    $scale = 2;
+                    $scaledW = $w * $scale;
+                    $scaledH = $h * $scale;
+                    $scaled = imagecreatetruecolor($scaledW + ($pad * 2), $scaledH + ($pad * 2));
+                    $whiteScaled = imagecolorallocate($scaled, 255, 255, 255);
+                    imagefilledrectangle($scaled, 0, 0, $scaledW + ($pad * 2), $scaledH + ($pad * 2), $whiteScaled);
+                    imagecopyresampled($scaled, $src, $pad, $pad, 0, 0, $scaledW, $scaledH, $w, $h);
+
+                    $qrcodeScaled = new QrReader($scaled, QrReader::SOURCE_TYPE_RESOURCE);
+                    $textScaled = trim($qrcodeScaled->text() ?: '');
+                    imagedestroy($scaled);
+                    if (!empty($textScaled)) {
+                        imagedestroy($src);
+                        return $textScaled;
+                    }
+                }
+
+                imagedestroy($src);
+            }
+        } catch (\Throwable $e) {
+            Log::warning("Error decodificando QR con GD: " . $e->getMessage());
+        }
+
+        return null;
+    }
+}

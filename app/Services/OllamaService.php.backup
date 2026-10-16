@@ -1,0 +1,239 @@
+<?php
+
+namespace App\Services;
+
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use App\Models\KnowledgeChunk;
+
+class OllamaService
+{
+    protected string $baseUrl;
+    protected string $chatModel;
+    protected string $embedModel;
+
+    public function __construct()
+    {
+        $this->baseUrl = config('services.ollama.base_url', 'http://127.0.0.1:11434');
+        $this->chatModel = config('services.ollama.chat_model', 'llama3.1');
+        $this->embedModel = config('services.ollama.embed_model', 'nomic-embed-text');
+    }
+
+    public function generateEmbedding(string $text): array
+    {
+        try {
+            // Aumentado a 120 segundos
+            $response = Http::timeout(120)->post("{$this->baseUrl}/api/embeddings", [
+                'model' => $this->embedModel,
+                'prompt' => $text,
+                'keep_alive' => '1h',
+            ]);
+
+            if ($response->successful()) {
+                return $response->json('embedding', []);
+            }
+            Log::error('Ollama Embedding Response Error: ' . $response->body());
+        } catch (\Exception $e) {
+            Log::error('Ollama Embedding Exception: ' . $e->getMessage());
+        }
+
+        return [];
+    }
+
+    public function getGlobalBehaviorRules(): string
+    {
+        // Solo inyectar reglas esenciales y limitar a máximo 3 chunks para no saturar el prompt
+        $chunks = KnowledgeChunk::where('is_system_rule', true)
+            ->orderBy('id', 'asc')
+            ->take(3)
+            ->get();
+
+        if ($chunks->isEmpty()) {
+            return '';
+        }
+
+        $rulesText = "";
+        foreach ($chunks as $chunk) {
+            $rulesText .= "- " . trim($chunk->chunk_content) . "\n\n";
+        }
+
+        return trim($rulesText);
+    }
+
+    public function searchRelevantChunks(string $query, int $limit = 4): string
+    {
+        $normalized = strtolower(trim($query));
+        if (strlen($normalized) <= 10 && in_array($normalized, ['hi', 'hello', 'hey', 'hola', 'thanks', 'gracias'])) {
+            return '';
+        }
+
+        $queryEmbedding = $this->generateEmbedding($query);
+        if (empty($queryEmbedding)) {
+            return '';
+        }
+
+        $searchTerms = preg_replace('/[+\-><\(\)~*\"@]+/', ' ', $query);
+        $searchTerms = trim(preg_replace('/\s+/', ' ', $searchTerms));
+
+        $queryBuilder = KnowledgeChunk::where('is_system_rule', false);
+
+        if (!empty($searchTerms)) {
+            $candidates = $queryBuilder->whereRaw("MATCH(chunk_content) AGAINST(? IN NATURAL LANGUAGE MODE)", [$searchTerms])
+                ->take(25)
+                ->get();
+        } else {
+            $candidates = collect();
+        }
+
+        if ($candidates->isEmpty()) {
+            $candidates = KnowledgeChunk::where('is_system_rule', false)
+                ->latest('id')
+                ->take(30)
+                ->get();
+        }
+
+        $scoredChunks = [];
+        foreach ($candidates as $chunk) {
+            $embedding = is_string($chunk->embedding) ? json_decode($chunk->embedding, true) : $chunk->embedding;
+            if (is_array($embedding)) {
+                $similarity = $this->cosineSimilarity($queryEmbedding, $embedding);
+                if ($similarity >= 0.25) { // Umbral ajustado para mayor captura
+                    $scoredChunks[] = [
+                        'doc' => $chunk->document_name,
+                        'content' => $chunk->chunk_content,
+                        'score' => $similarity,
+                    ];
+                }
+            }
+        }
+
+        if (empty($scoredChunks)) {
+            return '';
+        }
+
+        usort($scoredChunks, fn($a, $b) => $b['score'] <=> $a['score']);
+
+        $context = "";
+        foreach (array_slice($scoredChunks, 0, $limit) as $item) {
+            $context .= "• " . trim($item['content']) . "\n\n";
+        }
+
+        return trim($context);
+    }
+
+    public function chat(array $messages): array
+    {
+        try {
+            $response = Http::timeout(60)->post("{$this->baseUrl}/api/chat", [
+                'model' => $this->chatModel,
+                'messages' => $messages,
+                'stream' => false,
+                'keep_alive' => '1h',
+                'options' => [
+                'temperature' => 0.1,
+                'num_ctx' => 2048,
+                'num_thread' => 4,    // Exprime los 4 núcleos EPYC al máximo
+                'num_predict' => 300, // Limita respuestas a ~200-250 palabras
+            ]
+            ]);
+
+            if ($response->successful()) {
+                return $response->json('message', []);
+            }
+        } catch (\Exception $e) {
+            Log::error('Ollama Chat Exception: ' . $e->getMessage());
+        }
+
+        return [];
+    }
+
+    private function cosineSimilarity(array $vecA, array $vecB): float
+    {
+        $dotProduct = 0.0;
+        $normA = 0.0;
+        $normB = 0.0;
+        $count = count($vecA);
+
+        if ($count === 0 || count($vecB) !== $count) {
+            return 0.0;
+        }
+
+        for ($i = 0; $i < $count; $i++) {
+            $dotProduct += $vecA[$i] * $vecB[$i];
+            $normA += $vecA[$i] ** 2;
+            $normB += $vecB[$i] ** 2;
+        }
+
+        if ($normA == 0 || $normB == 0) {
+            return 0.0;
+        }
+
+        return $dotProduct / (sqrt($normA) * sqrt($normB));
+    }
+    public function chatStream(array $messages, callable $callback, array $customOptions = []): void
+    {
+        // Opciones optimizadas para CPU (EPYC 4 cores)
+        $defaultOptions = [
+            'temperature' => 0.1,
+            'num_ctx'     => 2048, // 2048 es mucho más rápido de procesar en CPU que 4096
+            'num_thread'  => 4,    // Forzar el uso de los 4 núcleos
+            'num_predict' => 250,  // Límite de seguridad para evitar respuestas infinitas
+        ];
+
+        $options = array_merge($defaultOptions, $customOptions);
+
+        $body = json_encode([
+            'model'      => $this->chatModel,
+            'messages'   => $messages,
+            'stream'     => true,
+            'keep_alive' => '2h',  // Mantiene el modelo caliente en memoria RAM
+            'options'    => $options,
+        ]);
+
+        $ch = curl_init("{$this->baseUrl}/api/chat");
+        curl_setopt_array($ch, [
+            CURLOPT_POST           => true,
+            CURLOPT_POSTFIELDS     => $body,
+            CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
+            CURLOPT_RETURNTRANSFER => false,
+            CURLOPT_TIMEOUT        => 120,
+            CURLOPT_WRITEFUNCTION  => function ($ch, $data) use ($callback) {
+                $lines = explode("\n", trim($data));
+                foreach ($lines as $line) {
+                    if (!empty(trim($line))) {
+                        $callback($line);
+                    }
+                }
+                return strlen($data);
+            }
+        ]);
+
+        curl_exec($ch);
+        curl_close($ch);
+    }
+    public function chatWithTools(array $messages, array $tools): array
+    {
+        $body = [
+            'model' => $this->chatModel,
+            'messages' => $messages,
+            'tools' => $tools, // Definición de funciones permitidas
+            'stream' => false,
+            'options' => [
+                'temperature' => 0.1,
+                'num_ctx' => 2048,
+            ]
+        ];
+
+        try {
+            $response = Http::timeout(60)->post("{$this->baseUrl}/api/chat", $body);
+            if ($response->successful()) {
+                return $response->json();
+            }
+        } catch (\Exception $e) {
+            Log::error('Ollama Tool Call Exception: ' . $e->getMessage());
+        }
+
+        return [];
+    }
+
+}
